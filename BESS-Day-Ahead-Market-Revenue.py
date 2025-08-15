@@ -1,199 +1,108 @@
+# app.py
+from __future__ import annotations
+
 import streamlit as st
-import datetime
-from src import entsoe_surrogate as es
-from src import entsoe_prices as ep
-from src import plot_day_ahead_market_prices as pu
-from src import optimize_battery_power_schedule as ob
-from src import bess_schedule_plotter as ps
-from src import degradation as dg
-
-# Initialize session state flags for simulations
-if 'run_ageing_sim' not in st.session_state:
-    st.session_state.run_ageing_sim = False
-if 'run_forecast_sim' not in st.session_state:
-    st.session_state.run_forecast_sim = False
-
-st.set_page_config(
-    page_title="BESS Optimizer Dashboard",
-    page_icon="⚡",
-)
-st.title("BESS Day-Ahead Market Trading")
-st.write(
-    "BESS Day-Ahead Market Trading is a tool written by Alessio Lodge (TNO) "
-    "that aims at providing a platform to evaluate BESS scheduling on the day-ahead market."
+from helper_functions import (
+    SystemParams,
+    generate_step_demand,
+    build_and_solve_lp,
+    make_main_dispatch_figure,
+    make_dashboard_figure,
 )
 
-# 1️⃣ Inputs
-st.subheader("🌐📅 Choose Your Market and Date")
-col1, col2 = st.columns(2)
-with col1:
-    market = st.text_input(
-        "Market", "DE", max_chars=2,
-        help="ISO 2-letter code (DE, NL, FR…)"
-    )
-with col2:
-    trade_day = st.date_input(
-        "Day", value=datetime.date.today(),
-        max_value=datetime.date.today(),
-        format="YYYY-MM-DD",
-        help="Delivery date of the 24h block."
-    )
 
-st.subheader("🔧🔋 Define Your System")
-c1, c2 = st.columns(2)
-c3, c4 = st.columns(2)
-with c1:
-    capacity_kwh = st.number_input(
-        "Battery Capacity [kWh]", 0.0, step=0.1, format="%.1f", value=1000.0,
-        help="Usable energy the battery can store."
-    )
-with c2:
-    start_soc = st.number_input(
-        "Starting SOC [%]", 0, 100, value=50, step=1,
-        help="State of charge at the beginning (0–100%)."
-    )
-with c3:
-    p_discharge_max = st.number_input(
-        "Max Discharge Power [kW]", 0.0, step=0.1, format="%.1f", value=500.0,
-        help="Max discharging power (kW)."
-    )
-with c4:
-    p_charge_max = st.number_input(
-        "Max Charge Power [kW]", 0.0, step=0.1, format="%.1f", value=500.0,
-        help="Max charging power (kW)."
-    )
+# ──────────────────────────────────────────────────────────────────────────────
+# Streamlit UI
+# ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Grid + Storage Optimizer", page_icon="⚡", layout="wide")
+st.title("⚡ Grid + Storage Optimizer (Day Profile)")
 
-# 2️⃣ Advanced Settings
-with st.expander("Advanced Settings"):
-    # Degradation cost toggle
-    add_deg_cost = st.toggle(
-        "Add cost based on battery degradation?",
-        value=False,
-        help="Include a usage-cost penalty?"
-    )
-    if add_deg_cost:
-        chemistry = st.selectbox(
-            "Chemistry", ("LFP", "NMC"), index=0,
-            help="Battery chemistry."
-        )
-        optimisation_routine = st.selectbox(
-            "Select Optimization Routine",
-            ("1: Non-linear LP", "2: Linear LP with best profit"),
-            index=0,
-            help="Solver variant (both identical for now)."
-        )
-        if st.button("🔄 Run simulation with ageing optimization", key="run_ageing"):
-            st.session_state.run_ageing_sim = True
+with st.sidebar:
+    st.header("Inputs")
+    hours = st.number_input("Hours", min_value=1, max_value=168, value=24, step=1)
+    grid_limit_kw = st.number_input("Grid limit [kW]", min_value=0.0, value=900.0, step=50.0)
 
-    # Imperfect knowledge toggle
-    add_imperfect_knowledge = st.toggle(
-        "Add imperfect knowledge of Day-ahead market",
-        value=False,
-        help=(
-            "The current model evaluates a schedule using the data of the day-ahead market, "
-            "known from 12:00 onwards. Selecting this method creates a schedule based on a forecast."
-        )
-    )
-    if add_imperfect_knowledge:
-        forecast_method = st.selectbox(
-            "Select Forecasting Method",
-            ("1: Statistical Method: LEAR", "2: Machine Learning Method: DNN"),
-            index=0,
-            help="Forecasting method for imperfect market knowledge."
-        )
-        if st.button("🔄 Run simulation with forecast", key="run_forecast"):
-            st.session_state.run_forecast_sim = True
+    colA, colB = st.columns(2)
+    with colA:
+        p_dis_max = st.number_input("Storage max discharge [kW]", min_value=0.0, value=500.0, step=50.0)
+    with colB:
+        p_ch_max = st.number_input("Storage max charge [kW]", min_value=0.0, value=500.0, step=50.0)
 
-# 3️⃣ Fetch prices & run BASE simulation automatically
-api_key_entsoe = st.secrets["api_keys"]["entsoe"]
-prices = ep.get_day_ahead_prices_single_day(market, trade_day, api_key=api_key_entsoe)
-result_base = ob.optimise_battery(
-    prices, capacity_kwh, start_soc,
-    p_charge_max, p_discharge_max,
-    dt=1.0
+    usable_energy = st.number_input("Usable nominal energy [kWh]", min_value=0.0, value=3000.0, step=100.0)
+
+    colC, colD = st.columns(2)
+    with colC:
+        eta_ch = st.number_input("η_charge", min_value=0.5, max_value=1.0, value=1.0, step=0.01)
+    with colD:
+        eta_dis = st.number_input("η_discharge", min_value=0.5, max_value=1.0, value=1.0, step=0.01)
+
+    init_soe_pct = st.slider("Initial SoE [%]", 0, 100, 100, 1)
+
+    enforce_final = st.checkbox("Enforce final SoE?", value=False)
+    final_soe_pct = st.slider("Final SoE [%]", 0, 100, 100, 1, disabled=not enforce_final)
+
+    st.markdown("---")
+    st.subheader("Demand shape")
+    peak_kw = st.number_input("Peak demand [kW]", min_value=0.0, value=1200.0, step=50.0)
+    avg_to_peak_ratio = st.slider("Avg / Peak ratio", 0.1, 1.0, 0.70, 0.01)
+    seed = st.number_input("Random seed", min_value=0, value=7, step=1)
+
+    st.markdown("---")
+    st.subheader("Objective weights")
+    unmet_penalty = st.number_input("Unmet penalty", min_value=0.0, value=1e8, step=1e6, format="%.0f")
+    fill_bias = st.number_input("Fill bias weight", min_value=0.0, value=1e-2, step=1e-3, format="%.4f")
+    move_pen = st.number_input("Move penalty", min_value=0.0, value=0.1, step=0.05, format="%.2f")
+
+# Build params object
+p = SystemParams(
+    hours=hours,
+    grid_limit_kw=grid_limit_kw,
+    storage_max_discharge_kw=p_dis_max,
+    storage_max_charge_kw=p_ch_max,
+    usable_nominal_energy_kwh=usable_energy,
+    eta_charge=eta_ch,
+    eta_discharge=eta_dis,
+    initial_soe=init_soe_pct / 100.0,
+    final_soe=(final_soe_pct / 100.0) if enforce_final else None,
+    unmet_penalty=unmet_penalty,
+    fill_bias_weight=fill_bias,
+    move_penalty=move_pen,
+    peak_kw=peak_kw,
+    avg_to_peak_ratio=avg_to_peak_ratio,
+    seed=seed,
 )
 
-# 4️⃣ Display BASE results when no advanced sim selected
-if not st.session_state.run_ageing_sim and not st.session_state.run_forecast_sim:
-    st.subheader("Day-Ahead Prices")
-    st.pyplot(pu.plot_day_ahead_prices(prices), use_container_width=True)
-    st.subheader("📈 Base Results (no ageing)")
-    st.markdown(f"**Expected revenue:** {result_base['revenue']:,.2f} €")
-    st.subheader("🕒 Schedule (no ageing penalty)")
-    st.pyplot(ps.plot_bess_schedule(
-        result_base["schedule"], country=market,
-        day=trade_day, e_nom=capacity_kwh
-    ), use_container_width=True)
+# Generate demand & solve LP
+demand = generate_step_demand(p)
 
-# 5️⃣ Ageing simulation
-if st.session_state.run_ageing_sim and add_deg_cost:
-    deg_params = dg.load_emperical_degradation_parameters(chemistry)
-    full_cost = capacity_kwh * 200
-    result_age = ob.optimise_battery_with_ageing_dp(
-        prices, capacity_kwh, start_soc,
-        p_charge_max, p_discharge_max,
-        298.15, deg_params, full_cost, dt=1.0
+grid, p_dis, p_ch, unmet, soe = build_and_solve_lp(
+    demand_kw=demand,
+    grid_limit_kw=p.grid_limit_kw,
+    storage_max_discharge_kw=p.storage_max_discharge_kw,
+    storage_max_charge_kw=p.storage_max_charge_kw,
+    usable_nominal_energy_kwh=p.usable_nominal_energy_kwh,
+    eta_charge=p.eta_charge,
+    eta_discharge=p.eta_discharge,
+    initial_soe=p.initial_soe,
+    final_soe=p.final_soe,
+    dt_hours=1.0,
+    unmet_penalty=p.unmet_penalty,
+    fill_bias_weight=p.fill_bias_weight,
+    move_penalty=p.move_penalty,
+)
+
+# Main stacked dispatch plot
+st.subheader("📊 Dispatch vs Demand (Stacked)")
+fig_dispatch = make_main_dispatch_figure(
+    demand, grid, p_dis, p_ch, unmet, p.grid_limit_kw,
+    title="Main Dispatch (Grid first, then Storage)",
+)
+st.plotly_chart(fig_dispatch, use_container_width=True)
+
+# Diagnostics dashboard (optional)
+with st.expander("More diagnostics (duration curves, histogram, SoE)"):
+    fig_dash = make_dashboard_figure(
+        demand, grid, p_dis, p_ch, unmet, soe, p.grid_limit_kw,
+        title="Grid Connection with Storage — Dashboard",
     )
-    ref_act = ob.evaluate_schedule_with_ageing(
-        result_base["P"], prices, capacity_kwh,
-        start_soc, 298.15, deg_params,
-        full_cost, dt=1.0
-    )
-    st.subheader("📈 Advanced Results with Ageing-Cost Penalty")
-    st.pyplot(ps.plot_bess_schedule(
-        result_age["schedule"], country=market,
-        day=trade_day, e_nom=capacity_kwh
-    ), use_container_width=True)
-    ac, cc, cl = (
-        result_age["ageing_cost"], result_age["ageing_cost_cyclic"], result_age["ageing_cost_calendar"]
-    )
-    st.write("** Cost-penalty Optimized Results::**")
-    st.markdown(
-        f"- Profit: **{result_age['profit']:,.2f} €**\n"
-        f"- Revenue: **{result_age['revenue']:,.2f} €**\n"
-        f"- Ageing cost: **{ac:,.2f} € (cyclic {cc:,.2f} €, calendar {cl:,.2f} €) €**"
-    )
-
-    st.write("** Un-optimized Results:**")
-    st.markdown(
-        f"- Profit: **{ref_act['profit']:,.2f} €**\n"
-        f"- Revenue: **{ref_act['revenue']:,.2f} €**\n"
-        f"- Ageing cost: **{ref_act['ageing_cost']:,.2f} €**"
-    )
-    # plot unoptimized
-    st.pyplot(ps.plot_bess_schedule(
-        ref_act["schedule"], country=market,
-        day=trade_day, e_nom=capacity_kwh
-    ), use_container_width=True)
-
-# 6️⃣ Forecast-based simulation
-if st.session_state.run_forecast_sim and add_imperfect_knowledge:
-    # Placeholder for future forecast function
-    known_prices = ep.get_day_ahead_prices_single_day(market, trade_day, api_key=api_key_entsoe)
-    forecast_prices = known_prices # ep.get_forecasted_day_ahead_prices( market, trade_day, api_key=api_key_entsoe, method=forecast_method)
-    result_fc = ob.optimise_battery(
-        forecast_prices, capacity_kwh, start_soc,
-        p_charge_max, p_discharge_max,
-        dt=1.0)
-    result_known_price = ob.optimise_battery(
-        known_prices, capacity_kwh, start_soc,
-        p_charge_max, p_discharge_max,
-        dt=1.0)
-    st.subheader("📈 Forecast-based Results (Imperfect Knowledge)") 
-    st.pyplot(pu.plot_day_ahead_prices_normal_and_forecasted(known_prices, forecast_prices), use_container_width=True) 
-    st.markdown(f"**Expected revenue (Imperfect Knowledge - Forecast Based):** {result_fc['revenue']:,.2f} €")
-    st.markdown(f"**Expected revenue (Perfect Knowledge):** {result_known_price['revenue']:,.2f} €")
-    
-    st.write("** Schedule with Imperfect Knowledge of Prices:**")
-
-    st.pyplot(ps.plot_bess_schedule(
-        result_fc["schedule"], country=market,
-        day=trade_day, e_nom=capacity_kwh
-    ), use_container_width=True)
-
-    st.write("** Schedule with Perfect Knowledge of Prices:**")
-
-    st.pyplot(ps.plot_bess_schedule(
-        result_known_price["schedule"], country=market,
-        day=trade_day, e_nom=capacity_kwh
-    ), use_container_width=True)
+    st.plotly_chart(fig_dash, use_container_width=True)
