@@ -19,41 +19,6 @@ class SystemParams:
     """Container for all model inputs and objective weights.
 
     All units are in kW/kWh and hours where applicable.
-
-    Attributes
-    ----------
-    hours : int
-        Number of discrete time steps (hours).
-    grid_limit_kw : float
-        Maximum grid import capacity (kW).
-    storage_max_discharge_kw : float
-        Max discharge power from storage (kW).
-    storage_max_charge_kw : float
-        Max charge power into storage (kW).
-    usable_nominal_energy_kwh : float
-        Usable energy capacity of the storage (kWh).
-    eta_charge : float
-        Charging efficiency (0–1).
-    eta_discharge : float
-        Discharging efficiency (0–1).
-    initial_soe : float
-        Initial state-of-energy as a fraction of usable capacity (0–1).
-    final_soe : Optional[float]
-        Target end-of-horizon SoE (0–1); None disables the constraint.
-    unmet_penalty : float
-        Cost weight for unmet demand (must dominate).
-    fill_bias_weight : float
-        Penalty weight to keep SoE higher (encourages early charging).
-    move_penalty : float
-        Small penalty on |charge| + |discharge| to avoid chattering.
-    peak_kw : float
-        Peak demand for the demand generator (kW).
-    avg_to_peak_ratio : float
-        Ratio of average demand to peak demand (0–1).
-    seed : int
-        Random seed for reproducibility of demand generator.
-    exact_square : bool
-        Kept for compatibility; not used explicitly.
     """
     hours: int = 24
     grid_limit_kw: float = 900.0
@@ -77,26 +42,11 @@ class SystemParams:
 # Demand generator
 # ──────────────────────────────────────────────────────────────────────────────
 def generate_step_demand(p: SystemParams) -> List[float]:
-    """Generate a two-level (low/peak) hourly demand profile with a given average.
-
-    The function creates a "square-wave-like" profile where some hours are at
-    peak demand and the rest at a random low level. The low level is sampled
-    to ensure the resulting average equals `avg_to_peak_ratio * peak_kw`.
-
-    Parameters
-    ----------
-    p : SystemParams
-        Parameters including hours, peak_kw, and avg_to_peak_ratio.
-
-    Returns
-    -------
-    List[float]
-        Demand in kW for each hour (length == p.hours).
-    """
+    """Generate a two-level (low/peak) hourly demand profile with a given average."""
     rnd = random.Random(p.seed)
     H = p.hours
     peak = float(p.peak_kw)
-    target_avg = p.avg_to_peak_ratio * peak
+    target_avg = float(p.avg_to_peak_ratio) * peak
 
     # Choose a plausible "low" level
     low_min = 0.15 * peak
@@ -140,10 +90,10 @@ def build_and_solve_lp(
     """Solve the dispatch problem with grid-first policy plus storage.
 
     Decision variables per hour:
-      - grid[h]  ≥ 0 : grid import (kW), capped by grid_limit_kw
-      - p_dis[h] ≥ 0 : storage discharge power (kW), capped by storage_max_discharge_kw
-      - p_ch[h]  ≥ 0 : storage charge power (kW), capped by storage_max_charge_kw
-      - unmet[h] ≥ 0 : unmet demand (kW), heavily penalized
+      - grid[h]  ≥ 0 : grid import (kW)
+      - p_dis[h] ≥ 0 : storage discharge power (kW)
+      - p_ch[h]  ≥ 0 : storage charge power (kW)
+      - unmet[h] ≥ 0 : unmet demand (kW)
 
     Storage dynamics:
       E[h+1] = E[h] + η_charge * p_ch[h] * dt - (p_dis[h] / η_discharge) * dt
@@ -158,6 +108,11 @@ def build_and_solve_lp(
 
     Returns the optimal time series for grid, p_dis, p_ch, unmet, and SoE (E/usable_energy).
     """
+    # Ensure pure floats and avoid division on LpVariables (use reciprocal)
+    dt_hours = float(dt_hours)
+    eta_charge = float(eta_charge)
+    inv_eta_discharge = 1.0 / float(eta_discharge)
+
     H = len(demand_kw)
     model = pulp.LpProblem("GridPlusStorageDispatch", pulp.LpMinimize)
 
@@ -167,35 +122,37 @@ def build_and_solve_lp(
     p_ch = pulp.LpVariable.dicts("storage_charge_kw", range(H), lowBound=0)
     unmet = pulp.LpVariable.dicts("unmet_kw", range(H), lowBound=0)
     E = pulp.LpVariable.dicts(
-        "E_kwh", range(H + 1), lowBound=0, upBound=usable_nominal_energy_kwh
+        "E_kwh", range(H + 1), lowBound=0, upBound=float(usable_nominal_energy_kwh)
     )
 
     # Initial and terminal energy constraints
-    model += E[0] == initial_soe * usable_nominal_energy_kwh, "init_energy"
+    model += E[0] == float(initial_soe) * float(usable_nominal_energy_kwh), "init_energy"
     if final_soe is not None:
-        model += E[H] == final_soe * usable_nominal_energy_kwh, "terminal_energy"
+        model += E[H] == float(final_soe) * float(usable_nominal_energy_kwh), "terminal_energy"
 
     # Per-hour constraints
     for h in range(H):
         # Power balance: grid + discharge - charge + unmet = demand
-        model += grid[h] + p_dis[h] - p_ch[h] + unmet[h] == demand_kw[h], f"balance_{h}"
+        model += grid[h] + p_dis[h] - p_ch[h] + unmet[h] == float(demand_kw[h]), f"balance_{h}"
 
         # Limits
-        model += grid[h] <= grid_limit_kw, f"grid_limit_{h}"
-        model += p_dis[h] <= storage_max_discharge_kw, f"dis_limit_{h}"
-        model += p_ch[h] <= storage_max_charge_kw, f"ch_limit_{h}"
+        model += grid[h] <= float(grid_limit_kw), f"grid_limit_{h}"
+        model += p_dis[h] <= float(storage_max_discharge_kw), f"dis_limit_{h}"
+        model += p_ch[h] <= float(storage_max_charge_kw), f"ch_limit_{h}"
 
-        # Energy dynamics
+        # Energy dynamics (NO division on PuLP expressions)
         model += (
             E[h + 1]
-            == E[h] + eta_charge * p_ch[h] * dt_hours - (p_dis[h] / eta_discharge) * dt_hours
+            == E[h]
+               + eta_charge * p_ch[h] * dt_hours
+               - (inv_eta_discharge * p_dis[h] * dt_hours)
         ), f"E_dyn_{h}"
 
     # Objective
     model += (
-        unmet_penalty * pulp.lpSum(unmet[h] for h in range(H))
-        + fill_bias_weight * pulp.lpSum((usable_nominal_energy_kwh - E[h + 1]) for h in range(H))
-        + move_penalty * (pulp.lpSum(p_dis[h] for h in range(H)) + pulp.lpSum(p_ch[h] for h in range(H)))
+        float(unmet_penalty) * pulp.lpSum(unmet[h] for h in range(H))
+        + float(fill_bias_weight) * pulp.lpSum((float(usable_nominal_energy_kwh) - E[h + 1]) for h in range(H))
+        + float(move_penalty) * (pulp.lpSum(p_dis[h] for h in range(H)) + pulp.lpSum(p_ch[h] for h in range(H)))
     )
 
     # Solve with default CBC solver
@@ -211,10 +168,8 @@ def build_and_solve_lp(
     E_sol = [pulp.value(E[h]) for h in range(H + 1)]
 
     # Convert to SoE fraction [0..1]
-    soe = [
-        e / usable_nominal_energy_kwh if usable_nominal_energy_kwh > 0 else float("nan")
-        for e in E_sol
-    ]
+    usable = float(usable_nominal_energy_kwh)
+    soe = [e / usable if usable > 0 else float("nan") for e in E_sol]
     return grid_sol, p_dis_sol, p_ch_sol, unmet_sol, soe
 
 
