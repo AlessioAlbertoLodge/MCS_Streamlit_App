@@ -7,14 +7,10 @@ import pandas as pd
 from typing import Tuple, List, Optional
 
 def _to_hours_from_hhmm(time_col: pd.Series) -> np.ndarray:
-    """Parse 'HH:MM' (or 'H:MM') to float hours."""
-    # strip, ensure string
     s = time_col.astype(str).str.strip()
-    # handle 'HH:MM'
     hh = s.str.extract(r'^(\d{1,2}):')[0].astype(float)
     mm = s.str.extract(r':(\d{2})$')[0].astype(float)
-    hours = hh + mm/60.0
-    return hours.to_numpy()
+    return (hh + mm/60.0).to_numpy()
 
 def _coerce_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
@@ -24,39 +20,31 @@ def load_demand_csv(
     time_unit: str = "hours",
     year: Optional[int] = None,
     prefer_years: Optional[List[int]] = None,
+    prefer_normalized: bool = True,   # <— NEW
 ) -> Tuple[np.ndarray, List[float]]:
     """
-    Load a CSV as time-vs-power[kW].
+    Load a CSV as time-vs-power.
 
-    Supports two formats:
-    1) Generic 2-column: [time, power] where time is hours or minutes (use time_unit)
-    2) Location avg-load: columns = 'Time', 'AvgLoad_<YYYY>_kW' (one or more years),
-       where 'Time' is 'HH:MM'.
+    Supported formats:
+    1) Generic 2-column: [time, power] (time in hours or minutes via `time_unit`)
+    2) Location avg-load: 'Time' + one or more of:
+         - 'AvgLoadNorm_<YYYY>'   (unitless, 0..1)  ← preferred when present
+         - 'AvgLoad_<YYYY>_kW'    (absolute kW)
 
     Parameters
     ----------
     file : UploadedFile, BytesIO, or str
-        Streamlit uploaded file, file-like buffer, or path.
-    time_unit : {"hours", "minutes"}
-        Unit of the first column for the generic 2-column format.
-    year : int | None
-        Desired year for the avg-load format. If None, choose using prefer_years or the latest available.
-    prefer_years : list[int] | None
-        Preference order when year is None, default [2021, 2020].
+    time_unit : {"hours","minutes"} for generic 2-col
+    year : desired year for avg-load format (optional)
+    prefer_years : priority order if year is None; default [2021, 2020]
+    prefer_normalized : if True, pick normalized columns when available
 
     Returns
     -------
     time_hours : np.ndarray
-        Time values in hours (float).
-    demand_kw : list[float]
-        Corresponding power demand (kW).
-
-    Raises
-    ------
-    ValueError
-        If the CSV is invalid or the requested year is not present.
+    demand_vals : list[float]   # normalized or kW depending on column chosen
     """
-    # Read file from buffer or path
+    # read file/buffer
     if isinstance(file, (io.BytesIO, io.BufferedReader)):
         df = pd.read_csv(file)
     else:
@@ -65,89 +53,88 @@ def load_demand_csv(
     if df.empty:
         raise ValueError("CSV is empty.")
 
-    # --- Detect avg-load (location) format -----------------------------------
-    # Needs a 'Time' column and at least one 'AvgLoad_<YYYY>_kW' column
-    avg_cols = [c for c in df.columns if re.fullmatch(r'AvgLoad_\d{4}_kW', c or "")]
-    if "Time" in df.columns and avg_cols:
-        # Choose year column
-        years_available = sorted(int(c.split('_')[1]) for c in avg_cols)
+    # Detect avg-load formats
+    norm_cols = [c for c in df.columns if re.fullmatch(r'AvgLoadNorm_\d{4}', c or "")]
+    kw_cols   = [c for c in df.columns if re.fullmatch(r'AvgLoad_\d{4}_kW', c or "")]
+
+    if "Time" in df.columns and (norm_cols or kw_cols):
+        # choose pool based on preference and availability
+        if prefer_normalized and norm_cols:
+            pool = sorted(norm_cols, key=lambda c: int(c.split('_')[1]))
+            make_col = lambda y: f"AvgLoadNorm_{y}"
+        else:
+            pool = sorted(kw_cols, key=lambda c: int(c.split('_')[1]))
+            make_col = lambda y: f"AvgLoad_{y}_kW"
+
+        if not pool:
+            raise ValueError("No matching avg-load columns found.")
+
+        years_available = sorted(int(c.split('_')[1]) for c in pool)
+
         if year is not None:
-            col = f"AvgLoad_{year}_kW"
+            col = make_col(year)
             if col not in df.columns:
-                raise ValueError(
-                    f"Requested year {year} not found. Available: {years_available}"
-                )
+                raise ValueError(f"Requested year {year} not in file. Available: {years_available}")
         else:
             prefs = prefer_years or [2021, 2020]
-            chosen = next((y for y in prefs if f"AvgLoad_{y}_kW" in df.columns), None)
+            chosen = next((y for y in prefs if make_col(y) in df.columns), None)
             if chosen is None:
-                chosen = max(years_available)  # fall back to latest
-            col = f"AvgLoad_{chosen}_kW"
+                chosen = max(years_available)
+            col = make_col(chosen)
 
-        # Parse Time as HH:MM → hours
+        # parse time as HH:MM, fallback numeric
         try:
             time_hours = _to_hours_from_hhmm(df["Time"])
         except Exception:
-            # if Time accidentally numeric (e.g., 0..95 or 0..24), try numeric
             num = _coerce_numeric(df["Time"])
             if num.notna().all():
-                # if it looks like 0..95 bins, convert bins to hours (×15min)
                 if num.max() <= 95 and num.min() >= 0 and num.nunique() >= 10:
                     time_hours = (num.to_numpy() * 15.0) / 60.0
                 else:
                     time_hours = num.to_numpy()
             else:
-                raise ValueError("Cannot parse 'Time' column to HH:MM or numeric hours.")
+                raise ValueError("Cannot parse 'Time' as HH:MM or numeric.")
 
-        demand_kw = _coerce_numeric(df[col]).to_numpy()
-        valid = ~np.isnan(time_hours) & ~np.isnan(demand_kw)
+        vals = _coerce_numeric(df[col]).to_numpy()
+        valid = ~np.isnan(time_hours) & ~np.isnan(vals)
         if not valid.any():
             raise ValueError("No valid numeric time/power pairs after parsing avg-load CSV.")
 
-        # sort by time and ensure strictly increasing
         order = np.argsort(time_hours[valid])
         time_hours = time_hours[valid][order]
-        demand_kw = demand_kw[valid][order]
+        vals = vals[valid][order]
 
-        # de-duplicate time bins if needed
+        # unique time bins
         _, idx = np.unique(time_hours, return_index=True)
         time_hours = time_hours[idx]
-        demand_kw = demand_kw[idx]
+        vals = vals[idx]
 
         if not np.all(np.diff(time_hours) > 0):
             raise ValueError("Time column must be strictly increasing after parsing.")
 
-        return time_hours, demand_kw.tolist()
+        return time_hours, vals.tolist()
 
-    # --- Fallback: generic 2-column format -----------------------------------
+    # Fallback: generic 2-column
     if df.shape[1] < 2:
         raise ValueError(
-            "CSV must contain either:\n"
-            " - 'Time' + 'AvgLoad_<YYYY>_kW' columns, or\n"
-            " - at least two columns: time and power[kW]."
+            "CSV must contain either avg-load columns or at least 2 columns: time, power."
         )
 
-    # Use first two columns (ignore headers if any)
     df2 = df.iloc[:, :2].copy()
     df2.columns = ["time", "power"]
     df2 = df2.dropna()
-
     df2["time"] = pd.to_numeric(df2["time"], errors="coerce")
     df2["power"] = pd.to_numeric(df2["power"], errors="coerce")
     df2 = df2.dropna()
     if df2.empty:
         raise ValueError("No valid numeric data found in CSV (generic format).")
 
-    # Convert time to hours if needed
     if time_unit.lower().startswith("min"):
         df2["time"] = df2["time"] / 60.0
 
-    # Sort and enforce strict increase
     df2 = df2.sort_values("time").drop_duplicates("time")
     time_hours = df2["time"].to_numpy()
-    demand_kw = df2["power"].to_numpy()
-
+    power = df2["power"].to_numpy()
     if not np.all(np.diff(time_hours) > 0):
         raise ValueError("Time column must be strictly increasing.")
-
-    return time_hours, demand_kw.tolist()
+    return time_hours, power.tolist()
