@@ -100,7 +100,7 @@ if mode == "Generate synthetic demand":
         eta_charge=1.0,
         eta_discharge=1.0,
         initial_soe=1.0,
-        final_soe=None,
+        final_soe=1.0,
         peak_kw=peak_kw,
         avg_to_peak_ratio=avg_to_peak_ratio,
         seed=seed,
