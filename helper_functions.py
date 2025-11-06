@@ -10,10 +10,51 @@ import pulp
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+"""
+helper_functions.py
+───────────────────────────────────────────────────────────────────────────────
+Core pieces for the Grid + Storage Optimizer: parameters, demand generator,
+LP-based dispatch solver, and Plotly visualizations.
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Data model for all system/global parameters
-# ──────────────────────────────────────────────────────────────────────────────
+What’s here
+- SystemParams: dataclass holding all model inputs and weights.
+  Units: kW, kWh, hours (time step = dt_hours).
+- generate_step_demand(): builds a simple two-level (low/peak) demand profile
+  matching a target average (avg_to_peak_ratio × peak_kw).
+- build_and_solve_lp(): linear program that dispatches grid + battery to meet
+  demand under a grid import limit.
+  • Decision vars per step h:
+      grid[h]   ≥ 0   (kW)
+      p_dis[h]  ≥ 0   (kW)
+      p_ch[h]   ≥ 0   (kW)
+      unmet[h]  ≥ 0   (kW)
+      E[h] ∈ [0, usable_nominal_energy_kwh] (kWh), with E[0] fixed; E[H] optional
+  • Power balance: grid + p_dis − p_ch + unmet = demand
+  • Energy update: E[h+1] = E[h] + η_ch·p_ch·dt − (p_dis/η_dis)·dt
+  • Limits: grid ≤ grid_limit_kw; p_dis ≤ storage_max_discharge_kw;
+            p_ch ≤ storage_max_charge_kw
+  • Objective (to minimize):
+        unmet_penalty · Σ unmet
+      + fill_bias_weight · Σ (usable_energy − E[h+1])
+      + move_penalty · (Σ p_dis + Σ p_ch)
+    Large unmet_penalty strongly discourages unmet demand. Small fill_bias_weight
+    nudges the solution to keep the battery reasonably filled. move_penalty
+    discourages unnecessary cycling.
+  • Returns: (grid, p_dis, p_ch, unmet, soe_fraction)
+
+- make_main_dispatch_figure(): stacked bars of grid/charge/discharge/unmet with
+  demand and grid limit overlaid.
+- make_dashboard_figure(): 2×2 panel with dispatch, duration curves, demand
+  histogram, and state-of-energy trace.
+
+Notes
+- Efficiencies are applied as constants (η_ch, η_dis). Use dt_hours to control
+  the step size. SoE is returned as a fraction of usable energy [0..1].
+- Solver: PuLP with CBC by default; raise if status is not Optimal/Feasible.
+"""
+
+
+
 @dataclass(frozen=True)
 class SystemParams:
     """Container for all model inputs and objective weights.

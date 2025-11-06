@@ -18,6 +18,25 @@ from helper_functions import (
 # Demand utilities
 # ──────────────────────────────────────────────────────────────────────────────
 
+"""
+helper_functions_2.py
+───────────────────────────────────────────────────────────────────────────────
+Functions for analyzing how much storage is needed to keep power demand below
+a grid limit, and what that storage would cost.
+
+It provides:
+- Tools to calculate and plot demand and grid limits.
+- A method to estimate the maximum discharge power required from storage.
+- A bisection-based routine that runs the LP solver repeatedly to find the
+  smallest battery energy that avoids unmet demand.
+- A function to calculate storage duration (energy / discharge).
+- A routine to test different grid limit levels (“grid shares”) and compute
+  the matching storage power, energy, duration, and cost for each case.
+
+Depends on helper_functions.py for LP formulation and dispatch simulation.
+"""
+
+
 def compute_max_demand(demand_kw: List[float]) -> float:
     """Return the maximum power of a demand series (kW)."""
     if not demand_kw:

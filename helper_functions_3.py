@@ -6,6 +6,27 @@ import numpy as np
 import pandas as pd
 from typing import Tuple, List, Optional
 
+"""
+helper_functions_3.py
+───────────────────────────────────────────────────────────────────────────────
+CSV loading and parsing utilities for demand profiles.
+
+This module reads various time–power CSV formats and converts them into
+(time in hours, demand values) pairs suitable for analysis or plotting.
+
+It supports:
+- Two-column CSVs with time and power, where time can be in hours or minutes.
+- Multi-year “average load” CSVs containing columns like:
+    • AvgLoadNorm_<YYYY>   (normalized 0–1 values)
+    • AvgLoad_<YYYY>_kW    (absolute demand in kW)
+- Automatic year selection based on preferences (e.g. 2021 → 2020 fallback).
+- Parsing of “HH:MM” formatted times or numeric intervals (e.g. 15-minute bins).
+- Validation for monotonic, numeric time and power series.
+
+Returns numpy arrays for time (in hours) and a list of float demand values.
+"""
+
+
 def _to_hours_from_hhmm(time_col: pd.Series) -> np.ndarray:
     s = time_col.astype(str).str.strip()
     hh = s.str.extract(r'^(\d{1,2}):')[0].astype(float)
