@@ -1,160 +1,146 @@
-# ⚡ BESS Day-Ahead Market Trading Dashboard
+# Grid + Storage Optimizer (Streamlit)
 
-![Streamlit](https://img.shields.io/badge/built%20with-Streamlit-ff4b4b?logo=streamlit&logoColor=white)
-![Python](https://img.shields.io/badge/python-%3E=3.9-blue?logo=python&logoColor=white)
+Interactive Streamlit app for exploring how a grid connection interacts with an energy-storage system (battery or equivalent).  
+Solve dispatch problems as a linear program (LP), find minimum energy to meet a grid limit, and study cost trade-offs between power, energy, and grid size.  
+Uses Streamlit + PuLP + Plotly.
 
-> **Interactive optimiser & back-tester for trading a Battery-Energy-Storage System (BESS) on the European day-ahead power market.**
+------------------------------------------------------------
+## Features
 
-The dashboard lets you **optimise a single day** or **back-test multiple days** of day-ahead prices, automatically fetched from the **ENTSO-E Transparency Platform**.  
-The optimiser is formulated as a *linear-programming* problem solved with **cvxpy** in milliseconds.  
-An optional **ageing-cost penalty** captures the revenue impact of faster battery degradation.
+- Dispatch simulation at hourly or 15-minute resolution
+- Minimum storage sizing for a fixed grid cap
+- Power/Energy/Grid cost trade-off scan
+- Deterministic synthetic demand generator (seeded)
+- Unified LP formulation shared across all pages
 
----
+Core stack: Streamlit UI, PuLP/CBC solver, Plotly charts.
+------------------------------------------------------------
+## App Pages
 
-## ✨ Features
+| Page | File | Purpose |
+|------|------|----------|
+| ⚡ Home – Grid + Storage Optimizer (Hourly) | Basic_Storage_Problem.py | Entry point; dispatch LP at 1-hour resolution with sidebar inputs |
+| ⏱ Main Dispatch (15-min) | pages/1_Main Dispatch.py | Same LP, finer Δt = 0.25 h, inputs on main page |
+| 📐 Minimum Storage for Grid Limit | pages/2_Minimum Storage for Grid Limit.py | Finds smallest storage energy (kWh) for zero unmet demand given grid cap |
+| 💰 Power/Energy Cost Trade-off | pages/3_Power Energy Cost Trade-off.py | Scans grid-share ratios and reports cheapest power/energy/grid combo |
+| 📚 Documentation | pages/3_Documentation.py | In-app help page |
 
-| Page | What it does |
-|------|--------------|
-| **Home** | Computes the *optimal 24-hour charge/discharge schedule* that maximises revenue for a chosen market day. Shows price curve, schedule and KPIs. |
-| **Multi-Day Revenue** | Loops the optimiser over a date range to create a *historic revenue back-test* with daily & cumulative plots. |
-| **Documentation** | In-app guide covering market context, maths, usage instructions and ageing-cost model. |
+Helpers: helper_functions.py, helper_functions_2.py
+------------------------------------------------------------
+## Quick Start
 
-* **Battery ageing cost**: toggle on/off and choose LFP or NMC empirical parameters.  
-* **Full ENTSO-E API integration**: no manual CSVs.  
-* **Beautiful charts** with Matplotlib & Streamlit native components.  
-* **CSV export-ready** dataframes for further analysis.  
+# 1) Clone the repo
+git clone https://github.com/<your-username>/MCS_Streamlit_App.git
+cd MCS_Streamlit_App
 
----
-## 🚀 Quick start
+# 2) Create virtual environment (optional)
+python -m venv .venv
+source .venv/bin/activate     # Windows: .venv\Scripts\activate
 
-### 1️⃣ Clone & install
-```bash
-git clone https://github.com/<your-username>/bess-dayahead-dashboard.git
-cd bess-dayahead-dashboard
+# 3) Install dependencies
 pip install -r requirements.txt
-```
 
-### 2️⃣ Configure the ENTSO-E API key
-Create a file `.streamlit/secrets.toml`:
-```toml
-[api_keys]
-entsoe = "YOUR_API_KEY_HERE"
-```
-—or export an environment variable `ENTSOE_API_KEY` instead.
+# 4) Run the app
+streamlit run Basic_Storage_Problem.py
 
-### 3️⃣ Run the app
-```bash
-streamlit run Home.py
-```
-Open the printed URL (usually [http://localhost:8501](http://localhost:8501)).
+Open the printed URL (usually http://localhost:8501).
+------------------------------------------------------------
+## Inputs & Outputs
 
----
+### Home / Main Dispatch
+Inputs:
+- grid_limit_kw, p_dis_max, p_ch_max
+- usable_nominal_energy_kwh, eta_ch, eta_dis
+- initial/final SoE
+- demand shape: peak_kw, avg_to_peak_ratio, seed
+- objective weights: unmet_penalty, fill_bias_weight, move_penalty
 
-## 🖥️ Repository layout
-```
-├── Home.py                         # Single-day optimiser page
-├── pages/
-│   ├── 02_multi_day_revenue.py    # Multi-day back-test page
-│   └── 03_Documentation.py        # In-app documentation
-├── src/                           # Core logic modules
-│   ├── entsoe_prices.py
-│   ├── optimize_battery_power_schedule.py
-│   ├── optimize_battery_power_schedule_with_ageing.py
-│   ├── plot_day_ahead_market_prices.py
-│   ├── bess_schedule_plotter.py
-│   ├── degradation.py
-│   └── ...
-├── requirements.txt
-└── README.md
-```
+Outputs:
+- Stacked dispatch plot (grid, charge/discharge, unmet, demand)
+- Diagnostics: duration curves, histogram, SoE trajectory
 
-## ⚙️ Mathematical formulation (extended)
+Default weights (15-min page):
+unmet_penalty = 1e8  
+fill_bias_weight = 1e-2  
+move_penalty = 0.1
+### Minimum Storage for Grid Limit
+Goal: smallest energy E_nom ensuring unmet ≈ 0
+Method:
+1) Generate demand
+2) p_dis_max = max(demand) – grid_limit
+3) Bisection on E_nom with LP solves
+Outputs: E_nom, p_dis_max, duration (h = E/P), plot
 
-The optimiser is a 24-step **linear programming (LP)** model solved with `cvxpy`.
+### Power / Energy Cost Trade-off
+Goal: minimize total cost
+Scan grid-share ratio r = G_limit / D_peak in [r_min, r_max]
+For each r:
+- grid_limit = r * max_demand
+- p_dis_max = max_demand – grid_limit
+- Solve for minimal energy
+Cost: C = c_power * P_dis,max + c_energy * E_nom
 
-### Decision variables
+Outputs: cheapest configuration, KPIs, and dispatch.
+------------------------------------------------------------
+## Mathematical Model
 
-| Symbol     | Description                                              | Units |
-|------------|----------------------------------------------------------|--------|
-| Pₕ         | Battery power in hour h (charging < 0, discharging > 0) | kW     |
-| SOCₕ       | State-of-charge at end of hour h                        | –      |
+Decision variables (per step h): G_h, P_dis_h, P_ch_h, U_h, E_h
 
-### Parameters
+Objective:
+min ( w_U ΣU_h + w_F Σ(E_nom – E_h) + w_M Σ(P_dis_h + P_ch_h) )
 
-| Symbol                    | Description                                      |
-|---------------------------|--------------------------------------------------|
-| Priceₕ                   | Day-ahead price for hour h (€/MWh)              |
-| E_nom                    | Nominal usable energy capacity (kWh)            |
-| P_ch,max, P_dis,max      | Charge / discharge power limits (kW)            |
-| η_ch, η_dis              | Charge / discharge efficiencies (fraction)      |
-| c_deg                    | (Optional) degradation cost coefficient (€/kWh) |
+Constraints:
+1. Power balance: G_h + P_dis_h – P_ch_h + U_h = D_h
+2. Grid limit: 0 ≤ G_h ≤ G_max
+3. Storage power: 0 ≤ P_dis_h ≤ P_dis_max, 0 ≤ P_ch_h ≤ P_ch_max
+4. Energy dynamics: E_{h+1} = E_h + η_ch P_ch_h Δt – (P_dis_h / η_dis) Δt
+5. Bounds: 0 ≤ E_h ≤ E_nom, E_0 = E_init, optional E_H = E_final
 
-### Objective
+Sizing LPs (pages 2 & 4) reuse this formulation while searching E_nom and grid ratio.
+------------------------------------------------------------
+## Demand Generator
 
-Maximise net revenue **minus** optional degradation cost:
+Function: generate_step_demand()
+- Two-level “low/peak” demand shape
+- Controlled by peak_kw, avg_to_peak_ratio, duration, resolution (1h or 0.25h)
+- Random seed for reproducibility
 
-**Maximise:**
-```
-Σₕ [ Pₕ × Priceₕ - c_deg × |Pₕ| ] × Δt, for h = 1 to 24
-```
-If ageing-cost mode is OFF, set `c_deg = 0`.
+------------------------------------------------------------
+## Tips
 
-### Constraints
+- Use 15-minute page for short-term dynamics.
+- Keep w_U high (>1e8) to force zero unmet energy.
+- Increase fill_bias_weight if SoE depletes too early.
+- Sweep peak_kw, avg_to_peak_ratio, or efficiencies for sensitivity tests.
+------------------------------------------------------------
+## Repository Layout
 
-1. **SOC dynamics**
-```
-SOCₕ = SOC₍ₕ₋₁₎ + [ η_ch × max(0, -Pₕ) - (1/η_dis) × max(0, Pₕ) ] / E_nom × Δt
-```
+MCS_Streamlit_App/
+├─ Basic_Storage_Problem.py
+├─ pages/
+│  ├─ 1_Main Dispatch.py
+│  ├─ 2_Minimum Storage for Grid Limit.py
+│  ├─ 3_Power Energy Cost Trade-off.py
+│  └─ 3_Documentation.py
+├─ helper_functions.py
+├─ helper_functions_2.py
+├─ requirements.txt
+├─ LICENSE
+└─ README.md
 
-2. **SOC bounds**
-```
-0 ≤ SOCₕ ≤ 1     for all h
-```
+------------------------------------------------------------
+## Development
 
-3. **Power limits**
-```
--P_ch,max ≤ Pₕ ≤ P_dis,max     for all h
-```
+streamlit run Basic_Storage_Problem.py --server.runOnSave true
 
-4. **Initial SOC**
-```
-SOC₀ = SOC_start
-```
+------------------------------------------------------------
+## License
 
-Note: `max(0, x)` denotes the positive part of x, ensuring efficiencies only apply during charging or discharging as appropriate. All relationships are linear, so the model yields a **globally optimal** schedule in milliseconds.
+Licensed under the Apache-2.0 License.  
+See LICENSE for details.
 
+------------------------------------------------------------
+## Contact
 
-
-## 📸 Screenshots
-| Home – Single-day optimisation | Multi-day back-test |
-|--------------------------------|---------------------|
-| <img src="docs/screenshot_single_day.png" width="45%"> | <img src="docs/screenshot_multi_day.png" width="45%"> |
-*(Add your own screenshots in `docs/` or remove this section.)*
-
----
-
-## 🤝 Contributing
-Pull requests are welcome! For major changes, please open an issue first to discuss your ideas.
-
-1. Fork the project  
-2. Create your feature branch (`git checkout -b feature/foo`)  
-3. Commit your changes (`git commit -am 'Add some foo'`)  
-4. Push to the branch (`git push origin feature/foo`)  
-5. Open a Pull Request  
-
-### Development tips  
-&nbsp;&nbsp;&nbsp;&nbsp;```bash  
-&nbsp;&nbsp;&nbsp;&nbsp;# optional: automatically reload when editing  
-&nbsp;&nbsp;&nbsp;&nbsp;streamlit run Home.py --server.runOnSave true  
-&nbsp;&nbsp;&nbsp;&nbsp;```  
-
----
-
-## 📄 License
-Distributed under the **MIT License**. See `LICENSE` for details.
-
----
-
-## 💬 Contact
-Alessio Lodge · <alessio.lodge@example.com>  
-Project link: <https://github.com/<your-username>/bess-dayahead-dashboard>
+Maintainer: Alessio A. Lodge  
+Repo: AlessioAlbertoLodge/MCS_Streamlit_App
