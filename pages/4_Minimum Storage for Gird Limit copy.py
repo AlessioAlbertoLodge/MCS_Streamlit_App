@@ -23,6 +23,9 @@ st.markdown(
     "Internally we use hours (solver), but we infer and display **Δt in minutes** and plot **time in hours**."
 )
 
+# ───────────────────────── Global tolerance (strict zero-unmet) ──────────────
+UNMET_TOL = 1e-9  # accept only solutions with unmet ≤ this (PUh or kWh, matching your input units)
+
 # ───────────────────────── Helpers ─────────────────────────
 def _snap_dt_hours(dt_h_raw: float) -> float:
     """Snap a raw dt (hours) to common intervals to avoid 0.025h-type artifacts."""
@@ -52,11 +55,12 @@ def _hour_tick_labels(n: int, dt_hours: float, num_ticks: int = 6):
     """Build tick positions (index space) & labels (HH:MM) for a Plotly figure over indices 0..n-1."""
     total_h = dt_hours * n
     hours = np.linspace(0, total_h, num=num_ticks)
+    # positions in index space
     idx_pos = np.clip((hours / dt_hours).round().astype(int), 0, max(0, n-1))
     labels = [f"{int(h):02d}:{int(round((h - int(h))*60)):02d}" for h in hours]
     return idx_pos.tolist(), labels
 
-# ───────────────────────── New helper: robust auto-pick init (init ≤ final) ──
+# ───────────────────────── Robust auto-pick (cycle-neutral, zero-unmet) ─────
 def auto_pick_init_cycle_neutral(
     demand_kw: list[float],
     grid_limit_kw: float,
@@ -78,13 +82,12 @@ def auto_pick_init_cycle_neutral(
 ) -> tuple[float, dict, float, tuple[float, float]]:
     """
     Scan initial SoE from init_max down to init_min and enforce final SoE = initial SoE (cycle-neutral),
-    which guarantees init ≤ final. Return the feasible pair that minimizes required energy.
-
-    Skips infeasible pairs (solver infeasible). Raises if none are feasible.
+    which guarantees init ≤ final. Accept ONLY candidates with unmet ≤ UNMET_TOL.
+    Return the feasible pair that minimizes required energy. Raise if none are feasible.
     """
     best = None  # (energy, sol, unmet, init)
-    # Build descending grid of initial SoE values
     n_steps = max(1, int(round((init_max - init_min) / max(1e-6, init_step))) + 1)
+
     for init_soe in np.linspace(init_max, init_min, n_steps):
         try:
             e, sol, unmet = find_min_storage_energy_bisect(
@@ -95,7 +98,7 @@ def auto_pick_init_cycle_neutral(
                 eta_ch=eta_ch,
                 eta_dis=eta_dis,
                 init_soe_frac=float(init_soe),
-                final_soe_frac=float(init_soe),  # enforce init ≤ final (equal)
+                final_soe_frac=float(init_soe),  # cycle-neutral ⇒ init ≤ final enforced
                 dt_hours=dt_hours,
                 tol_kwh=tol_kwh,
                 max_iter=max_iter,
@@ -105,25 +108,22 @@ def auto_pick_init_cycle_neutral(
                 add_safety_buffer=add_safety_buffer,
             )
         except Exception:
-            # Infeasible for this init → skip
-            continue
+            continue  # infeasible for this init
 
-        if best is None:
-            best = (e, sol, unmet, init_soe)
-        else:
-            be, _, bun, _ = best
-            # Prefer lower energy; tie-breaker: lower unmet
-            if e < be - 1e-9 or (abs(e - be) <= 1e-9 and unmet < bun):
-                best = (e, sol, unmet, init_soe)
+        if unmet is None or unmet > UNMET_TOL:
+            continue  # reject non-zero-unmet candidates
+
+        if best is None or e < best[0] - 1e-9:
+            best = (e, sol, unmet, float(init_soe))
 
     if best is None:
         raise RuntimeError(
-            "No feasible solution found for any initial SoE in the specified scan range. "
-            "Consider relaxing the grid limit, increasing p_dis/p_ch caps, or widening the initial SoE range."
+            "No zero-unmet solution found in the scanned initial SoE range. "
+            "Relax the grid limit, increase p_dis/p_ch caps, or widen the scan range."
         )
 
-    be, bsol, bun, bi = best
-    return be, bsol, bun, (float(bi), float(bi))
+    e, sol, unmet, init = best
+    return e, sol, unmet, (init, init)
 
 # ───────────────────────── Inputs — Demand section ─────────────────────────
 st.subheader("Demand setup")
@@ -247,11 +247,11 @@ with c2b:
 with c2c:
     soe_mode = st.radio(
         "Initial SoE mode",
-        ["Manual (choose initial SoE)", "Auto scan (init ≤ final; find least energy)"],
-        help="Manual = you set initial SoE; Auto = scan initial SoE from 100%→50% and enforce final = initial.",
+        ["Manual (choose initial SoE)", "Auto scan (init ≤ final; zero-unmet, least energy)"],
+        help="Manual = you set initial SoE; Auto = scan initial SoE from 100%→min% with final = initial and require zero unmet.",
     )
 
-# If manual mode, show the slider (like before). If auto, show a disabled hint and scan controls.
+# If manual mode, show slider. If auto, show scan controls.
 init_soe_pct = None
 scan_min = 50
 scan_step = 2
@@ -263,7 +263,7 @@ else:
         scan_min = st.slider("Scan minimum initial SoE [%]", 0, 100, 50, 1)
     with cscan2:
         scan_step = st.slider("Scan step [%]", 1, 20, 2, 1)
-    st.caption("Auto mode enforces final SoE = initial SoE (cycle-neutral), ensuring init ≤ final by construction.")
+    st.caption("Auto mode enforces final SoE = initial SoE (cycle-neutral) and discards any solution with unmet > 0.")
 
 # ───────────────────────── Demand preview ─────────────────────────
 if demand_for_calc is not None and len(demand_for_calc) > 0:
@@ -332,7 +332,7 @@ if demand_for_calc is not None and len(demand_for_calc) > 0:
 
     if run:
         if soe_mode.startswith("Manual"):
-            # Manual initial SoE; final SoE free (None)
+            # Manual initial SoE; final SoE free (None) — but REJECT if unmet > UNMET_TOL
             try:
                 min_energy, sol, unmet = find_min_storage_energy_bisect(
                     demand_kw=demand_for_calc,
@@ -353,6 +353,13 @@ if demand_for_calc is not None and len(demand_for_calc) > 0:
                 )
             except Exception as e:
                 st.error(f"Solver error (manual): {e}")
+                st.stop()
+
+            if unmet is None or unmet > UNMET_TOL:
+                st.error(
+                    f"Result not accepted: unmet = {unmet:.6g} (> tolerance {UNMET_TOL}). "
+                    "Increase discharge/charge caps, raise grid limit, or adjust the initial SoE."
+                )
                 st.stop()
 
             duration_h = storage_duration_hours(min_energy, p_dis_max)
@@ -400,7 +407,7 @@ if demand_for_calc is not None and len(demand_for_calc) > 0:
                 st.info("Grid limit ≥ max demand → no storage required (0 units).")
 
         else:
-            # Auto scan: enforce final = initial; scan 100%→scan_min%
+            # Auto scan: enforce final = initial; scan 100%→scan_min%; accept only zero-unmet
             try:
                 best_energy, best_sol, best_unmet, (best_init, best_final) = auto_pick_init_cycle_neutral(
                     demand_kw=demand_for_calc,
