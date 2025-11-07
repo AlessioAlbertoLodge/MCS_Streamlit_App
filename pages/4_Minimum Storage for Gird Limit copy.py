@@ -57,6 +57,88 @@ def _hour_tick_labels(n: int, dt_hours: float, num_ticks: int = 6):
     labels = [f"{int(h):02d}:{int(round((h - int(h))*60)):02d}" for h in hours]
     return idx_pos.tolist(), labels
 
+# ───────────────────────── New helper: auto-pick (init, final) SoE ────────────
+def auto_pick_init_final_soe(
+    demand_kw: list[float],
+    grid_limit_kw: float,
+    p_dis_max: float,
+    p_ch_max: float,
+    eta_ch: float,
+    eta_dis: float,
+    dt_hours: float,
+    *,
+    tol_kwh: float = 0.05,
+    max_iter: int = 60,
+    unmet_penalty: float = 1e12,
+    fill_bias_weight: float = 1e-4,
+    move_penalty: float = 1e-4,
+    add_safety_buffer: bool = True,
+) -> tuple[float, dict, float, tuple[float, float]]:
+    """
+    Coarse→refined search over (init <= final) in [0,1] that minimizes required storage energy,
+    subject to zero unmet (via large unmet_penalty). Returns (min_energy, sol, unmet, (init, final)).
+    """
+    best_energy = None
+    best_sol = None
+    best_unmet = None
+    best_pair: tuple[float, float] = (None, None)  # type: ignore
+
+    # Coarse grid over final, then initial in [0, final]
+    finals = np.linspace(0.0, 1.0, 21)  # step 0.05
+    for f in finals:
+        inits = np.linspace(0.0, f, max(2, int(f * 20) + 1))
+        for i in inits:
+            e, sol, unmet = find_min_storage_energy_bisect(
+                demand_kw=demand_kw,
+                grid_limit_kw=grid_limit_kw,
+                p_dis_max=p_dis_max,
+                p_ch_max=p_ch_max,
+                eta_ch=eta_ch,
+                eta_dis=eta_dis,
+                init_soe_frac=float(i),
+                final_soe_frac=float(f),
+                dt_hours=dt_hours,
+                tol_kwh=tol_kwh,
+                max_iter=max_iter,
+                unmet_penalty=unmet_penalty,
+                fill_bias_weight=fill_bias_weight,
+                move_penalty=move_penalty,
+                add_safety_buffer=add_safety_buffer,
+            )
+            if best_energy is None or e < best_energy - 1e-9 or (abs(e - best_energy) <= 1e-9 and (best_unmet is None or unmet < best_unmet)):
+                best_energy, best_sol, best_unmet, best_pair = e, sol, unmet, (float(i), float(f))
+
+    # Local refinement around the best pair (±0.1 window, step 0.01)
+    if best_pair[0] is not None:
+        i0, f0 = best_pair
+        f_lo, f_hi = max(0.0, f0 - 0.1), min(1.0, f0 + 0.1)
+        for f in np.linspace(f_lo, f_hi, int(round((f_hi - f_lo) / 0.01)) + 1):
+            i_lo, i_hi = max(0.0, min(i0, f) - 0.1), min(f, i0 + 0.1)
+            if i_hi < i_lo + 1e-12:
+                continue
+            for i in np.linspace(i_lo, i_hi, int(round((i_hi - i_lo) / 0.01)) + 1):
+                e, sol, unmet = find_min_storage_energy_bisect(
+                    demand_kw=demand_kw,
+                    grid_limit_kw=grid_limit_kw,
+                    p_dis_max=p_dis_max,
+                    p_ch_max=p_ch_max,
+                    eta_ch=eta_ch,
+                    eta_dis=eta_dis,
+                    init_soe_frac=float(i),
+                    final_soe_frac=float(f),
+                    dt_hours=dt_hours,
+                    tol_kwh=tol_kwh,
+                    max_iter=max_iter,
+                    unmet_penalty=unmet_penalty,
+                    fill_bias_weight=fill_bias_weight,
+                    move_penalty=move_penalty,
+                    add_safety_buffer=add_safety_buffer,
+                )
+                if e < best_energy - 1e-9 or (abs(e - best_energy) <= 1e-9 and unmet < best_unmet):
+                    best_energy, best_sol, best_unmet, best_pair = e, sol, unmet, (float(i), float(f))
+
+    return best_energy, best_sol, best_unmet, best_pair
+
 # ───────────────────────── Inputs — Demand section ─────────────────────────
 st.subheader("Demand setup")
 
@@ -179,7 +261,7 @@ with c2a:
 with c2b:
     eta_dis = st.number_input("η_discharge", min_value=0.5, max_value=1.0, value=1.0, step=0.01)
 with c2c:
-    init_soe_pct = st.slider("Initial SoE assumed for sizing [%]", 0, 100, 100, 1)
+    st.text_input("Initial SoE", value="auto (init ≤ final)", disabled=True)
 
 # ───────────────────────── Demand preview ─────────────────────────
 if demand_for_calc is not None and len(demand_for_calc) > 0:
@@ -258,16 +340,15 @@ if demand_for_calc is not None and len(demand_for_calc) > 0:
     run = st.button("▶️ Size minimum storage (prioritise zero unmet)")
 
     if run:
-        min_energy, sol, unmet = find_min_storage_energy_bisect(
+        # Auto-select (init, final) with constraint init ≤ final that minimizes energy
+        best_energy, best_sol, best_unmet, (best_init, best_final) = auto_pick_init_final_soe(
             demand_kw=demand_for_calc,
             grid_limit_kw=grid_limit_val,
             p_dis_max=p_dis_max,
             p_ch_max=p_dis_max,
             eta_ch=eta_ch,
             eta_dis=eta_dis,
-            init_soe_frac=init_soe_pct / 100.0,
-            final_soe_frac=None,
-            dt_hours=dt_hours,              # ← robust, snapped to minutes
+            dt_hours=dt_hours,
             tol_kwh=0.05,
             max_iter=60,
             unmet_penalty=1e12,
@@ -276,7 +357,7 @@ if demand_for_calc is not None and len(demand_for_calc) > 0:
             add_safety_buffer=True,
         )
 
-        duration_h = storage_duration_hours(min_energy, p_dis_max)
+        duration_h = storage_duration_hours(best_energy, p_dis_max)
 
         k1, k2, k3, k4 = st.columns(4)
         with k1:
@@ -286,14 +367,18 @@ if demand_for_calc is not None and len(demand_for_calc) > 0:
         with k3:
             st.metric(f"Discharge cap ({grid_label})", f"{p_dis_max:,.3f}")
         with k4:
-            st.metric(f"Min energy ({'PUh' if energy_units=='PUh' else 'kWh'})", f"{min_energy:,.4f}")
+            st.metric(f"Min energy ({'PUh' if energy_units=='PUh' else 'kWh'})", f"{best_energy:,.4f}")
+
+        k5, k6, k7 = st.columns(3)
+        with k5:
+            st.metric("Picked Initial SoE", f"{best_init*100:,.1f} %")
+        with k6:
+            st.metric("Picked Final SoE", f"{best_final*100:,.1f} %")
+        with k7:
+            st.metric(f"Unmet ({'PUh' if energy_units=='PUh' else 'kWh'})", f"{best_unmet:,.6f}")
 
         st.write(
             f"<small><b>Storage duration:</b> {duration_h:,.2f} h (energy / discharge)</small>",
-            unsafe_allow_html=True,
-        )
-        st.write(
-            f"<small><b>Unmet energy:</b> {unmet:,.6f} {'PUh' if energy_units=='PUh' else 'kWh'}</small>",
             unsafe_allow_html=True,
         )
 
@@ -301,17 +386,17 @@ if demand_for_calc is not None and len(demand_for_calc) > 0:
             st.markdown("#### Dispatch check at sized energy")
             from helper_functions import make_main_dispatch_figure
             fig2 = make_main_dispatch_figure(
-                demand=sol["demand"],
-                grid=sol["grid"],
-                storage_discharge=sol["p_dis"],
-                storage_charge=sol["p_ch"],
-                unmet=sol["unmet"],
-                grid_limit_kw=sol["grid_limit_kw"],
+                demand=best_sol["demand"],
+                grid=best_sol["grid"],
+                storage_discharge=best_sol["p_dis"],
+                storage_charge=best_sol["p_ch"],
+                unmet=best_sol["unmet"],
+                grid_limit_kw=best_sol["grid_limit_kw"],
                 title=f"Dispatch with minimal storage ({'PU' if energy_units=='PUh' else 'kW'}, {int(round(dt_hours*60))}-min steps)",
             )
-            # Relabel x to hours here too
+            # Relabel x to hours
             try:
-                tickvals2, ticktext2 = _hour_tick_labels(len(sol["demand"]), dt_hours, num_ticks=6)
+                tickvals2, ticktext2 = _hour_tick_labels(len(best_sol["demand"]), dt_hours, num_ticks=6)
                 fig2.update_xaxes(
                     tickmode="array",
                     tickvals=tickvals2,
