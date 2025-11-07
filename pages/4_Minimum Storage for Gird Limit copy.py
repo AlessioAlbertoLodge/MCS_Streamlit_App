@@ -52,13 +52,12 @@ def _hour_tick_labels(n: int, dt_hours: float, num_ticks: int = 6):
     """Build tick positions (index space) & labels (HH:MM) for a Plotly figure over indices 0..n-1."""
     total_h = dt_hours * n
     hours = np.linspace(0, total_h, num=num_ticks)
-    # positions in index space
     idx_pos = np.clip((hours / dt_hours).round().astype(int), 0, max(0, n-1))
     labels = [f"{int(h):02d}:{int(round((h - int(h))*60)):02d}" for h in hours]
     return idx_pos.tolist(), labels
 
-# ───────────────────────── New helper: auto-pick (init, final) SoE ────────────
-def auto_pick_init_final_soe(
+# ───────────────────────── New helper: robust auto-pick init (init ≤ final) ──
+def auto_pick_init_cycle_neutral(
     demand_kw: list[float],
     grid_limit_kw: float,
     p_dis_max: float,
@@ -67,6 +66,9 @@ def auto_pick_init_final_soe(
     eta_dis: float,
     dt_hours: float,
     *,
+    init_max: float = 1.0,
+    init_min: float = 0.5,
+    init_step: float = 0.02,
     tol_kwh: float = 0.05,
     max_iter: int = 60,
     unmet_penalty: float = 1e12,
@@ -75,19 +77,16 @@ def auto_pick_init_final_soe(
     add_safety_buffer: bool = True,
 ) -> tuple[float, dict, float, tuple[float, float]]:
     """
-    Coarse→refined search over (init <= final) in [0,1] that minimizes required storage energy,
-    subject to zero unmet (via large unmet_penalty). Returns (min_energy, sol, unmet, (init, final)).
-    """
-    best_energy = None
-    best_sol = None
-    best_unmet = None
-    best_pair: tuple[float, float] = (None, None)  # type: ignore
+    Scan initial SoE from init_max down to init_min and enforce final SoE = initial SoE (cycle-neutral),
+    which guarantees init ≤ final. Return the feasible pair that minimizes required energy.
 
-    # Coarse grid over final, then initial in [0, final]
-    finals = np.linspace(0.0, 1.0, 21)  # step 0.05
-    for f in finals:
-        inits = np.linspace(0.0, f, max(2, int(f * 20) + 1))
-        for i in inits:
+    Skips infeasible pairs (solver infeasible). Raises if none are feasible.
+    """
+    best = None  # (energy, sol, unmet, init)
+    # Build descending grid of initial SoE values
+    n_steps = max(1, int(round((init_max - init_min) / max(1e-6, init_step))) + 1)
+    for init_soe in np.linspace(init_max, init_min, n_steps):
+        try:
             e, sol, unmet = find_min_storage_energy_bisect(
                 demand_kw=demand_kw,
                 grid_limit_kw=grid_limit_kw,
@@ -95,8 +94,8 @@ def auto_pick_init_final_soe(
                 p_ch_max=p_ch_max,
                 eta_ch=eta_ch,
                 eta_dis=eta_dis,
-                init_soe_frac=float(i),
-                final_soe_frac=float(f),
+                init_soe_frac=float(init_soe),
+                final_soe_frac=float(init_soe),  # enforce init ≤ final (equal)
                 dt_hours=dt_hours,
                 tol_kwh=tol_kwh,
                 max_iter=max_iter,
@@ -105,39 +104,26 @@ def auto_pick_init_final_soe(
                 move_penalty=move_penalty,
                 add_safety_buffer=add_safety_buffer,
             )
-            if best_energy is None or e < best_energy - 1e-9 or (abs(e - best_energy) <= 1e-9 and (best_unmet is None or unmet < best_unmet)):
-                best_energy, best_sol, best_unmet, best_pair = e, sol, unmet, (float(i), float(f))
+        except Exception:
+            # Infeasible for this init → skip
+            continue
 
-    # Local refinement around the best pair (±0.1 window, step 0.01)
-    if best_pair[0] is not None:
-        i0, f0 = best_pair
-        f_lo, f_hi = max(0.0, f0 - 0.1), min(1.0, f0 + 0.1)
-        for f in np.linspace(f_lo, f_hi, int(round((f_hi - f_lo) / 0.01)) + 1):
-            i_lo, i_hi = max(0.0, min(i0, f) - 0.1), min(f, i0 + 0.1)
-            if i_hi < i_lo + 1e-12:
-                continue
-            for i in np.linspace(i_lo, i_hi, int(round((i_hi - i_lo) / 0.01)) + 1):
-                e, sol, unmet = find_min_storage_energy_bisect(
-                    demand_kw=demand_kw,
-                    grid_limit_kw=grid_limit_kw,
-                    p_dis_max=p_dis_max,
-                    p_ch_max=p_ch_max,
-                    eta_ch=eta_ch,
-                    eta_dis=eta_dis,
-                    init_soe_frac=float(i),
-                    final_soe_frac=float(f),
-                    dt_hours=dt_hours,
-                    tol_kwh=tol_kwh,
-                    max_iter=max_iter,
-                    unmet_penalty=unmet_penalty,
-                    fill_bias_weight=fill_bias_weight,
-                    move_penalty=move_penalty,
-                    add_safety_buffer=add_safety_buffer,
-                )
-                if e < best_energy - 1e-9 or (abs(e - best_energy) <= 1e-9 and unmet < best_unmet):
-                    best_energy, best_sol, best_unmet, best_pair = e, sol, unmet, (float(i), float(f))
+        if best is None:
+            best = (e, sol, unmet, init_soe)
+        else:
+            be, _, bun, _ = best
+            # Prefer lower energy; tie-breaker: lower unmet
+            if e < be - 1e-9 or (abs(e - be) <= 1e-9 and unmet < bun):
+                best = (e, sol, unmet, init_soe)
 
-    return best_energy, best_sol, best_unmet, best_pair
+    if best is None:
+        raise RuntimeError(
+            "No feasible solution found for any initial SoE in the specified scan range. "
+            "Consider relaxing the grid limit, increasing p_dis/p_ch caps, or widening the initial SoE range."
+        )
+
+    be, bsol, bun, bi = best
+    return be, bsol, bun, (float(bi), float(bi))
 
 # ───────────────────────── Inputs — Demand section ─────────────────────────
 st.subheader("Demand setup")
@@ -188,7 +174,6 @@ if mode == "Generate synthetic demand":
         seed=seed,
     )
     demand = np.asarray(generate_step_demand(p_for_demand), dtype=float)  # kW
-    # synth time vector in hours for nicer dt inference/plot labels
     time_vec_hours = np.arange(steps, dtype=float) * 0.25
     using_normalized = False
 
@@ -204,7 +189,6 @@ else:
 
     if uploaded_file is not None:
         try:
-            # Treat generic two-column time as **minutes**; prefer normalized if present
             time_vec_h, vals = load_demand_csv(
                 uploaded_file,
                 time_unit="minutes",
@@ -261,27 +245,38 @@ with c2a:
 with c2b:
     eta_dis = st.number_input("η_discharge", min_value=0.5, max_value=1.0, value=1.0, step=0.01)
 with c2c:
-    st.text_input("Initial SoE", value="auto (init ≤ final)", disabled=True)
+    soe_mode = st.radio(
+        "Initial SoE mode",
+        ["Manual (choose initial SoE)", "Auto scan (init ≤ final; find least energy)"],
+        help="Manual = you set initial SoE; Auto = scan initial SoE from 100%→50% and enforce final = initial.",
+    )
+
+# If manual mode, show the slider (like before). If auto, show a disabled hint and scan controls.
+init_soe_pct = None
+scan_min = 50
+scan_step = 2
+if soe_mode.startswith("Manual"):
+    init_soe_pct = st.slider("Initial SoE assumed for sizing [%]", 0, 100, 100, 1)
+else:
+    cscan1, cscan2 = st.columns(2)
+    with cscan1:
+        scan_min = st.slider("Scan minimum initial SoE [%]", 0, 100, 50, 1)
+    with cscan2:
+        scan_step = st.slider("Scan step [%]", 1, 20, 2, 1)
+    st.caption("Auto mode enforces final SoE = initial SoE (cycle-neutral), ensuring init ≤ final by construction.")
 
 # ───────────────────────── Demand preview ─────────────────────────
 if demand_for_calc is not None and len(demand_for_calc) > 0:
-    # Infer dt and duration (in hours); display Δt in minutes
     dt_hours, total_hours = _infer_dt_and_duration(time_vec_hours, len(demand_for_calc))
     dt_minutes = dt_hours * 60.0
 
     max_dem = compute_max_demand(demand_for_calc)
     st.markdown("#### Demand preview")
-    fig = make_demand_figure(demand_for_calc)  # returns a Plotly fig; x-axis currently in index (steps)
+    fig = make_demand_figure(demand_for_calc)
 
-    # Relabel x-axis to hours
     tickvals, ticktext = _hour_tick_labels(len(demand_for_calc), dt_hours, num_ticks=6)
     try:
-        fig.update_xaxes(
-            tickmode="array",
-            tickvals=tickvals,
-            ticktext=ticktext,
-            title_text="Time [h]"
-        )
+        fig.update_xaxes(tickmode="array", tickvals=tickvals, ticktext=ticktext, title_text="Time [h]")
     except Exception:
         pass
 
@@ -298,7 +293,6 @@ st.markdown("---")
 st.subheader("Storage sizing under a grid limit")
 
 if demand_for_calc is not None and len(demand_for_calc) > 0:
-    # Reuse the same dt
     dt_hours, total_hours = _infer_dt_and_duration(time_vec_hours, len(demand_for_calc))
 
     if energy_units == "PUh":
@@ -312,7 +306,6 @@ if demand_for_calc is not None and len(demand_for_calc) > 0:
             grid_limit_pu = float(pct)
         else:
             grid_limit_pu = st.number_input("Grid limit [PU]", min_value=0.0, max_value=1.0, value=0.70, step=0.01)
-
         grid_limit_val = grid_limit_pu
         grid_label = "PU"
     else:
@@ -326,87 +319,155 @@ if demand_for_calc is not None and len(demand_for_calc) > 0:
         else:
             pct = st.slider("Grid limit [% of peak]", 0.0, 100.0, 70.0, 0.5) / 100.0
             grid_limit_kw = float(pct * compute_max_demand(demand_for_calc))
-
         grid_limit_val = grid_limit_kw
         grid_label = "kW"
 
     # ── Compute discharge cap and run sizing ─────────────────────────────────
     p_dis_max = derive_discharge_cap_from_grid_limit(demand_for_calc, grid_limit_val)
     st.caption(
-        f"Prescribed discharge cap = max(demand) − grid limit = "
-        f"**{p_dis_max:,.3f} {grid_label}** (clamped ≥ 0)."
+        f"Prescribed discharge cap = max(demand) − grid limit = **{p_dis_max:,.3f} {grid_label}** (clamped ≥ 0)."
     )
 
     run = st.button("▶️ Size minimum storage (prioritise zero unmet)")
 
     if run:
-        # Auto-select (init, final) with constraint init ≤ final that minimizes energy
-        best_energy, best_sol, best_unmet, (best_init, best_final) = auto_pick_init_final_soe(
-            demand_kw=demand_for_calc,
-            grid_limit_kw=grid_limit_val,
-            p_dis_max=p_dis_max,
-            p_ch_max=p_dis_max,
-            eta_ch=eta_ch,
-            eta_dis=eta_dis,
-            dt_hours=dt_hours,
-            tol_kwh=0.05,
-            max_iter=60,
-            unmet_penalty=1e12,
-            fill_bias_weight=1e-4,
-            move_penalty=1e-4,
-            add_safety_buffer=True,
-        )
-
-        duration_h = storage_duration_hours(best_energy, p_dis_max)
-
-        k1, k2, k3, k4 = st.columns(4)
-        with k1:
-            st.metric(f"Max demand ({grid_label})", f"{compute_max_demand(demand_for_calc):,.3f}")
-        with k2:
-            st.metric(f"Grid limit ({grid_label})", f"{grid_limit_val:,.3f}")
-        with k3:
-            st.metric(f"Discharge cap ({grid_label})", f"{p_dis_max:,.3f}")
-        with k4:
-            st.metric(f"Min energy ({'PUh' if energy_units=='PUh' else 'kWh'})", f"{best_energy:,.4f}")
-
-        k5, k6, k7 = st.columns(3)
-        with k5:
-            st.metric("Picked Initial SoE", f"{best_init*100:,.1f} %")
-        with k6:
-            st.metric("Picked Final SoE", f"{best_final*100:,.1f} %")
-        with k7:
-            st.metric(f"Unmet ({'PUh' if energy_units=='PUh' else 'kWh'})", f"{best_unmet:,.6f}")
-
-        st.write(
-            f"<small><b>Storage duration:</b> {duration_h:,.2f} h (energy / discharge)</small>",
-            unsafe_allow_html=True,
-        )
-
-        if p_dis_max > 0:
-            st.markdown("#### Dispatch check at sized energy")
-            from helper_functions import make_main_dispatch_figure
-            fig2 = make_main_dispatch_figure(
-                demand=best_sol["demand"],
-                grid=best_sol["grid"],
-                storage_discharge=best_sol["p_dis"],
-                storage_charge=best_sol["p_ch"],
-                unmet=best_sol["unmet"],
-                grid_limit_kw=best_sol["grid_limit_kw"],
-                title=f"Dispatch with minimal storage ({'PU' if energy_units=='PUh' else 'kW'}, {int(round(dt_hours*60))}-min steps)",
-            )
-            # Relabel x to hours
+        if soe_mode.startswith("Manual"):
+            # Manual initial SoE; final SoE free (None)
             try:
-                tickvals2, ticktext2 = _hour_tick_labels(len(best_sol["demand"]), dt_hours, num_ticks=6)
-                fig2.update_xaxes(
-                    tickmode="array",
-                    tickvals=tickvals2,
-                    ticktext=ticktext2,
-                    title_text="Time [h]"
+                min_energy, sol, unmet = find_min_storage_energy_bisect(
+                    demand_kw=demand_for_calc,
+                    grid_limit_kw=grid_limit_val,
+                    p_dis_max=p_dis_max,
+                    p_ch_max=p_dis_max,
+                    eta_ch=eta_ch,
+                    eta_dis=eta_dis,
+                    init_soe_frac=(init_soe_pct or 0) / 100.0,
+                    final_soe_frac=None,
+                    dt_hours=dt_hours,
+                    tol_kwh=0.05,
+                    max_iter=60,
+                    unmet_penalty=1e12,
+                    fill_bias_weight=1e-4,
+                    move_penalty=1e-4,
+                    add_safety_buffer=True,
                 )
-            except Exception:
-                pass
-            st.plotly_chart(fig2, use_container_width=True)
+            except Exception as e:
+                st.error(f"Solver error (manual): {e}")
+                st.stop()
+
+            duration_h = storage_duration_hours(min_energy, p_dis_max)
+
+            k1, k2, k3, k4 = st.columns(4)
+            with k1:
+                st.metric(f"Max demand ({grid_label})", f"{compute_max_demand(demand_for_calc):,.3f}")
+            with k2:
+                st.metric(f"Grid limit ({grid_label})", f"{grid_limit_val:,.3f}")
+            with k3:
+                st.metric(f"Discharge cap ({grid_label})", f"{p_dis_max:,.3f}")
+            with k4:
+                st.metric(f"Min energy ({'PUh' if energy_units=='PUh' else 'kWh'})", f"{min_energy:,.4f}")
+
+            k5, k6 = st.columns(2)
+            with k5:
+                st.metric("Initial SoE (manual)", f"{(init_soe_pct or 0):.1f} %")
+            with k6:
+                st.metric(f"Unmet ({'PUh' if energy_units=='PUh' else 'kWh'})", f"{unmet:,.6f}")
+
+            st.write(
+                f"<small><b>Storage duration:</b> {duration_h:,.2f} h (energy / discharge)</small>",
+                unsafe_allow_html=True,
+            )
+
+            if p_dis_max > 0:
+                st.markdown("#### Dispatch check at sized energy")
+                from helper_functions import make_main_dispatch_figure
+                fig2 = make_main_dispatch_figure(
+                    demand=sol["demand"],
+                    grid=sol["grid"],
+                    storage_discharge=sol["p_dis"],
+                    storage_charge=sol["p_ch"],
+                    unmet=sol["unmet"],
+                    grid_limit_kw=sol["grid_limit_kw"],
+                    title=f"Dispatch with minimal storage ({'PU' if energy_units=='PUh' else 'kW'}, {int(round(dt_hours*60))}-min steps)",
+                )
+                try:
+                    tickvals2, ticktext2 = _hour_tick_labels(len(sol["demand"]), dt_hours, num_ticks=6)
+                    fig2.update_xaxes(tickmode="array", tickvals=tickvals2, ticktext=ticktext2, title_text="Time [h]")
+                except Exception:
+                    pass
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("Grid limit ≥ max demand → no storage required (0 units).")
+
         else:
-            st.info("Grid limit ≥ max demand → no storage required (0 units).")
+            # Auto scan: enforce final = initial; scan 100%→scan_min%
+            try:
+                best_energy, best_sol, best_unmet, (best_init, best_final) = auto_pick_init_cycle_neutral(
+                    demand_kw=demand_for_calc,
+                    grid_limit_kw=grid_limit_val,
+                    p_dis_max=p_dis_max,
+                    p_ch_max=p_dis_max,
+                    eta_ch=eta_ch,
+                    eta_dis=eta_dis,
+                    dt_hours=dt_hours,
+                    init_max=1.0,
+                    init_min=(scan_min / 100.0),
+                    init_step=(scan_step / 100.0),
+                    tol_kwh=0.05,
+                    max_iter=60,
+                    unmet_penalty=1e12,
+                    fill_bias_weight=1e-4,
+                    move_penalty=1e-4,
+                    add_safety_buffer=True,
+                )
+            except Exception as e:
+                st.error(f"Auto-scan failed: {e}")
+                st.stop()
+
+            duration_h = storage_duration_hours(best_energy, p_dis_max)
+
+            k1, k2, k3, k4 = st.columns(4)
+            with k1:
+                st.metric(f"Max demand ({grid_label})", f"{compute_max_demand(demand_for_calc):,.3f}")
+            with k2:
+                st.metric(f"Grid limit ({grid_label})", f"{grid_limit_val:,.3f}")
+            with k3:
+                st.metric(f"Discharge cap ({grid_label})", f"{p_dis_max:,.3f}")
+            with k4:
+                st.metric(f"Min energy ({'PUh' if energy_units=='PUh' else 'kWh'})", f"{best_energy:,.4f}")
+
+            k5, k6, k7 = st.columns(3)
+            with k5:
+                st.metric("Picked Initial SoE", f"{best_init*100:,.1f} %")
+            with k6:
+                st.metric("Picked Final SoE", f"{best_final*100:,.1f} %")
+            with k7:
+                st.metric(f"Unmet ({'PUh' if energy_units=='PUh' else 'kWh'})", f"{best_unmet:,.6f}")
+
+            st.write(
+                f"<small><b>Storage duration:</b> {duration_h:,.2f} h (energy / discharge)</small>",
+                unsafe_allow_html=True,
+            )
+
+            if p_dis_max > 0:
+                st.markdown("#### Dispatch check at sized energy")
+                from helper_functions import make_main_dispatch_figure
+                fig2 = make_main_dispatch_figure(
+                    demand=best_sol["demand"],
+                    grid=best_sol["grid"],
+                    storage_discharge=best_sol["p_dis"],
+                    storage_charge=best_sol["p_ch"],
+                    unmet=best_sol["unmet"],
+                    grid_limit_kw=best_sol["grid_limit_kw"],
+                    title=f"Dispatch with minimal storage ({'PU' if energy_units=='PUh' else 'kW'}, {int(round(dt_hours*60))}-min steps)",
+                )
+                try:
+                    tickvals2, ticktext2 = _hour_tick_labels(len(best_sol["demand"]), dt_hours, num_ticks=6)
+                    fig2.update_xaxes(tickmode="array", tickvals=tickvals2, ticktext=ticktext2, title_text="Time [h]")
+                except Exception:
+                    pass
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("Grid limit ≥ max demand → no storage required (0 units).")
 else:
     st.warning("No valid demand data available for sizing.")
